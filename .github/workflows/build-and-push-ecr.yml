@@ -1,0 +1,66 @@
+name: Build and Push ECR
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  docker:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: api
+            dockerfile: Dockerfile.api
+            repository: infra-loc-api
+          - name: worker
+            dockerfile: Dockerfile.worker
+            repository: infra-loc-worker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Login to Amazon ECR
+        if: github.event_name != 'pull_request'
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tags
+        id: meta
+        run: |
+          SHA_TAG=${GITHUB_SHA::8}
+          echo "sha_tag=$SHA_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build image (PR validation)
+        if: github.event_name == 'pull_request'
+        run: |
+          docker build \
+            -f ${{ matrix.dockerfile }} \
+            -t local/${{ matrix.repository }}:${{ steps.meta.outputs.sha_tag }} \
+            .
+
+      - name: Build and push image
+        if: github.event_name != 'pull_request'
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          REPOSITORY: ${{ matrix.repository }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          LATEST_TAG: ${{ steps.meta.outputs.latest_tag }}
+        run: |
+          IMAGE_URI="$ECR_REGISTRY/$REPOSITORY"
+          docker build -f ${{ matrix.dockerfile }} -t "$IMAGE_URI:$SHA_TAG" .
+          docker push "$IMAGE_URI:$SHA_TAG"
+          if [ -n "$LATEST_TAG" ]; then
+            docker tag "$IMAGE_URI:$SHA_TAG" "$IMAGE_URI:$LATEST_TAG"
+            docker push "$IMAGE_URI:$LATEST_TAG"
+          fi
