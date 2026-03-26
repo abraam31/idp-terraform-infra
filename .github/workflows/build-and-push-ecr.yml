@@ -22,10 +22,10 @@ jobs:
         include:
           - name: api
             dockerfile: Dockerfile.api
-            repository: infra-loc-api
+            repository: idp/infra-api
           - name: worker
             dockerfile: Dockerfile.worker
-            repository: infra-loc-worker
+            repository: idp/infra-worker
     steps:
       - name: Checkout
         uses: actions/checkout@v4
