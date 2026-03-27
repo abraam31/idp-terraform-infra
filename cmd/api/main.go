@@ -28,6 +28,10 @@ func main() {
 	if queueURL == "" {
 		log.Fatal("SQS_QUEUE_URL is required")
 	}
+	apiToken := strings.TrimSpace(os.Getenv("IDP_API_TOKEN"))
+	if apiToken == "" {
+		log.Fatal("IDP_API_TOKEN is required")
+	}
 	sqsQueue, err := queue.NewSQSQueue(context.Background(), awsRegion, queueURL)
 	if err != nil {
 		log.Fatalf("failed to initialize sqs queue: %v", err)
@@ -51,31 +55,47 @@ func main() {
 	})))
 	// Webhook endpoint: MVP treats body as YAML file content from PR
 	mux.Handle("/webhooks/git", withLogging(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqID := strings.TrimSpace(r.Header.Get("X-Request-Id"))
+		if reqID == "" {
+			reqID = "req-" + time.Now().UTC().Format("20060102T150405.000000000Z0700")
+		}
+
 		if r.Method != http.MethodPost {
+			log.Printf("webhook rejected request_id=%s reason=method_not_allowed method=%s path=%s", reqID, r.Method, r.URL.Path)
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if strings.TrimSpace(r.Header.Get("Authorization")) != "Bearer "+apiToken {
+			log.Printf("webhook unauthorized request_id=%s remote_addr=%s user_agent=%q", reqID, r.RemoteAddr, r.UserAgent())
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		defer r.Body.Close()
 
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
+			log.Printf("webhook bad request request_id=%s reason=read_body_failed err=%v", reqID, err)
 			http.Error(w, "unable to read body", http.StatusBadRequest)
 			return
 		}
+		log.Printf("webhook accepted request_id=%s content_type=%q body_bytes=%d", reqID, r.Header.Get("Content-Type"), len(body))
 
 		yamlBytes, err := resolveYAMLInput(r.Context(), r.Header.Get("Content-Type"), body, samplePath, fileFetcher)
 		if err != nil {
+			log.Printf("webhook bad request request_id=%s reason=resolve_yaml_input_failed err=%v", reqID, err)
 			http.Error(w, "unable to resolve yaml input: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 		envName, specMap, err := parseEnvSpec(yamlBytes)
 		if err != nil {
+			log.Printf("webhook bad request request_id=%s reason=parse_env_spec_failed err=%v", reqID, err)
 			http.Error(w, "invalid yaml: "+err.Error(), http.StatusBadRequest)
 			return
 		}
 
 		awsMap, _ := specMap["aws"].(map[string]any)
 		if len(awsMap) == 0 {
+			log.Printf("webhook bad request request_id=%s reason=missing_aws_spec", reqID)
 			http.Error(w, "aws is required and must contain at least one resource (body bytes="+
 				fmt.Sprintf("%d", len(body))+")", http.StatusBadRequest)
 			return
@@ -95,10 +115,13 @@ func main() {
 		}
 		b, _ := json.MarshalIndent(out, "", "  ")
 		if _, err := sqsQueue.Enqueue(r.Context(), "plan", b); err != nil {
+			log.Printf("webhook enqueue failed request_id=%s queue_url=%q aws_region=%q err=%v", reqID, queueURL, awsRegion, err)
 			http.Error(w, "failed to enqueue worker job", http.StatusInternalServerError)
 			return
 		}
+		log.Printf("webhook enqueue success request_id=%s job_id=%s", reqID, jobID)
 		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Request-Id", reqID)
 		w.WriteHeader(http.StatusAccepted)
 		_, _ = w.Write(b)
 	})))
