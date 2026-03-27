@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -38,7 +40,23 @@ func main() {
 	}
 	samplePath := getenv("SAMPLE_YAML_PATH", "./sample.yaml")
 	mockRepoRoot := getenv("MOCK_REPO_ROOT", "./mock-repo")
-	fileFetcher := LocalRepoFetcher{Root: mockRepoRoot}
+	localFetcher := LocalRepoFetcher{Root: mockRepoRoot}
+	var githubFetcher FileFetcher
+	githubToken := strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+	if githubToken != "" {
+		githubFetcher = GitHubRepoFetcher{
+			Token:   githubToken,
+			BaseURL: getenv("GITHUB_API_BASE_URL", "https://api.github.com"),
+			Client:  &http.Client{Timeout: 15 * time.Second},
+		}
+		log.Printf("github file fetcher enabled")
+	} else {
+		log.Printf("github file fetcher disabled: GITHUB_TOKEN not set")
+	}
+	eventFetcher := SourceAwareFetcher{
+		Local:  localFetcher,
+		GitHub: githubFetcher,
+	}
 
 	mux := http.NewServeMux()
 	mux.Handle("/healthz", withLogging(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -80,7 +98,7 @@ func main() {
 		}
 		log.Printf("webhook accepted request_id=%s content_type=%q body_bytes=%d", reqID, r.Header.Get("Content-Type"), len(body))
 
-		yamlBytes, err := resolveYAMLInput(r.Context(), r.Header.Get("Content-Type"), body, samplePath, fileFetcher)
+		yamlBytes, err := resolveYAMLInput(r.Context(), r.Header.Get("Content-Type"), body, samplePath, eventFetcher)
 		if err != nil {
 			log.Printf("webhook bad request request_id=%s reason=resolve_yaml_input_failed err=%v", reqID, err)
 			http.Error(w, "unable to resolve yaml input: "+err.Error(), http.StatusBadRequest)
@@ -226,22 +244,48 @@ func resolveEnvConfig(env string) map[string]any {
 }
 
 type WebhookEvent struct {
+	EventName    string   `json:"event_name"`
+	Action       string   `json:"action"`
+	Source       string   `json:"source"`
 	Repo         string   `json:"repo"`
 	PRNumber     int      `json:"pr_number"`
+	SHA          string   `json:"sha"`
+	Ref          string   `json:"ref"`
 	ChangedFiles []string `json:"changed_files"`
-	FilePath     string   `json:"file_path"` // compatibility shim
-	Content      string   `json:"content"`   // compatibility shim
+}
+
+// DownstreamEvent represents the new JSON schema sent by the GitHub Action.
+// This replaces the previous POC shape. No backward compatibility is kept.
+type DownstreamEvent struct {
+	EventName    string            `json:"event_name"`
+	Action       string            `json:"action"`
+	Source       string            `json:"source"` // github | local | auto (default)
+	Repository   string            `json:"repository"`
+	Organization string            `json:"organization"`
+	SHA          string            `json:"sha"`
+	Ref          string            `json:"ref"`
+	Actor        string            `json:"actor"`
+	Run          map[string]any `json:"run"` // contains id, attempt
+	PullRequest  struct {
+		Number any    `json:"number"`
+		URL    string `json:"url"`
+	} `json:"pull_request"`
+	ChangedFiles []string `json:"changed_files"`
 }
 
 type FileFetcher interface {
-	FetchFile(ctx context.Context, repo string, prNumber int, filePath string) ([]byte, error)
+	FetchFile(ctx context.Context, repo string, prNumber int, ref string, filePath string) ([]byte, error)
+}
+
+type EventFileFetcher interface {
+	FetchFirst(ctx context.Context, evt WebhookEvent, candidates []string) ([]byte, string, error)
 }
 
 type LocalRepoFetcher struct {
 	Root string
 }
 
-func (f LocalRepoFetcher) FetchFile(_ context.Context, _ string, _ int, filePath string) ([]byte, error) {
+func (f LocalRepoFetcher) FetchFile(_ context.Context, _ string, _ int, _ string, filePath string) ([]byte, error) {
 	if strings.TrimSpace(filePath) == "" {
 		return nil, errors.New("empty file path")
 	}
@@ -249,7 +293,130 @@ func (f LocalRepoFetcher) FetchFile(_ context.Context, _ string, _ int, filePath
 	return os.ReadFile(fsPath)
 }
 
-func resolveYAMLInput(ctx context.Context, contentType string, body []byte, samplePath string, fetcher FileFetcher) ([]byte, error) {
+type GitHubRepoFetcher struct {
+	Token   string
+	BaseURL string
+	Client  *http.Client
+}
+
+func (f GitHubRepoFetcher) FetchFile(ctx context.Context, repo string, _ int, ref string, filePath string) ([]byte, error) {
+	repo = strings.TrimSpace(repo)
+	filePath = strings.TrimSpace(filePath)
+	ref = strings.TrimSpace(ref)
+	if repo == "" || filePath == "" || ref == "" {
+		return nil, fmt.Errorf("repo, file path and sha/ref are required")
+	}
+	base := strings.TrimRight(strings.TrimSpace(f.BaseURL), "/")
+	if base == "" {
+		base = "https://api.github.com"
+	}
+	client := f.Client
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	u := fmt.Sprintf("%s/repos/%s/contents/%s?ref=%s", base, repo, encodeGitHubPath(filePath), url.QueryEscape(ref))
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+f.Token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	respBody, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("github api returned %d for %s: %s", resp.StatusCode, filePath, strings.TrimSpace(string(respBody)))
+	}
+	var payload struct {
+		Content  string `json:"content"`
+		Encoding string `json:"encoding"`
+	}
+	if err := json.Unmarshal(respBody, &payload); err != nil {
+		return nil, fmt.Errorf("invalid github content response: %w", err)
+	}
+	if payload.Encoding != "base64" {
+		return nil, fmt.Errorf("unsupported github content encoding: %q", payload.Encoding)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(strings.ReplaceAll(payload.Content, "\n", ""))
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode github file content: %w", err)
+	}
+	return decoded, nil
+}
+
+func encodeGitHubPath(p string) string {
+	parts := strings.Split(filepath.ToSlash(strings.TrimSpace(p)), "/")
+	encoded := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		encoded = append(encoded, url.PathEscape(part))
+	}
+	return strings.Join(encoded, "/")
+}
+
+type SourceAwareFetcher struct {
+	Local  FileFetcher
+	GitHub FileFetcher
+}
+
+func (f SourceAwareFetcher) FetchFirst(ctx context.Context, evt WebhookEvent, candidates []string) ([]byte, string, error) {
+	fetchers := f.fetchersForSource(evt.Source)
+	if len(fetchers) == 0 {
+		return nil, "", fmt.Errorf("no file fetcher available for source=%q", evt.Source)
+	}
+	for _, p := range candidates {
+		for idx, fetcher := range fetchers {
+			if b, err := fetcher.FetchFile(ctx, evt.Repo, evt.PRNumber, evt.SHA, p); err == nil && len(strings.TrimSpace(string(b))) > 0 {
+				return b, p, nil
+			} else if err != nil {
+				log.Printf("webhook fetch failed source=%q path=%q fetcher_index=%d err=%v", evt.Source, p, idx, err)
+			}
+		}
+	}
+	return nil, "", errors.New("no yaml content resolved from changed_files")
+}
+
+func (f SourceAwareFetcher) fetchersForSource(source string) []FileFetcher {
+	mode := strings.ToLower(strings.TrimSpace(source))
+	switch mode {
+	case "github":
+		if f.GitHub != nil {
+			return []FileFetcher{f.GitHub}
+		}
+		return nil
+	case "local":
+		if f.Local != nil {
+			return []FileFetcher{f.Local}
+		}
+		return nil
+	case "", "auto":
+		out := make([]FileFetcher, 0, 2)
+		if f.GitHub != nil {
+			out = append(out, f.GitHub)
+		}
+		if f.Local != nil {
+			out = append(out, f.Local)
+		}
+		return out
+	default:
+		return f.fetchersForSource("auto")
+	}
+}
+
+func resolveYAMLInput(
+	ctx context.Context,
+	contentType string,
+	body []byte,
+	samplePath string,
+	eventFetcher EventFileFetcher,
+) ([]byte, error) {
 	// 1) Raw YAML body flow (manual testing / direct API calls)
 	if !strings.Contains(contentType, "application/json") {
 		trimmed := strings.TrimSpace(string(body))
@@ -264,16 +431,14 @@ func resolveYAMLInput(ctx context.Context, contentType string, body []byte, samp
 	if err != nil {
 		return nil, err
 	}
-	// Optional inline content shortcut
-	if strings.TrimSpace(evt.Content) != "" {
-		return []byte(strings.TrimSpace(evt.Content)), nil
-	}
+	// Log parsed basic metadata for observability
+	log.Printf("webhook parsed event event_name=%q action=%q source=%q repo=%q pr_number=%d changed_files=%d",
+		evt.EventName, evt.Action, evt.Source, evt.Repo, evt.PRNumber, len(evt.ChangedFiles))
 
 	candidates := inferInfraPaths(evt)
-	for _, p := range candidates {
-		if b, err := fetcher.FetchFile(ctx, evt.Repo, evt.PRNumber, p); err == nil && len(strings.TrimSpace(string(b))) > 0 {
-			return b, nil
-		}
+	if b, path, err := eventFetcher.FetchFirst(ctx, evt, candidates); err == nil {
+		log.Printf("webhook yaml source=changed_files path=%q", path)
+		return b, nil
 	}
 
 	// 3) Final fallback for local MVP
@@ -281,26 +446,72 @@ func resolveYAMLInput(ctx context.Context, contentType string, body []byte, samp
 }
 
 func parseWebhookEvent(body []byte) (WebhookEvent, error) {
-	var evt WebhookEvent
-	if err := json.Unmarshal(body, &evt); err != nil {
+	var d DownstreamEvent
+	if err := json.Unmarshal(body, &d); err != nil {
 		return WebhookEvent{}, fmt.Errorf("invalid json webhook: %w", err)
 	}
-	return evt, nil
+	prNum, err := parsePRNumber(d.PullRequest.Number)
+	if err != nil {
+		return WebhookEvent{}, err
+	}
+	org := strings.TrimSpace(d.Organization)
+	repo := strings.TrimSpace(d.Repository)
+	if org == "" || repo == "" {
+		return WebhookEvent{}, fmt.Errorf("organization and repository are required")
+	}
+	return WebhookEvent{
+		EventName:    strings.TrimSpace(d.EventName),
+		Action:       strings.TrimSpace(d.Action),
+		Source:       strings.TrimSpace(d.Source),
+		Repo:         org + "/" + repo,
+		PRNumber:     prNum,
+		SHA:          strings.TrimSpace(d.SHA),
+		Ref:          strings.TrimSpace(d.Ref),
+		ChangedFiles: append([]string{}, d.ChangedFiles...),
+	}, nil
+}
+
+func parsePRNumber(v any) (int, error) {
+	if v == nil {
+		return 0, fmt.Errorf("missing pull_request.number")
+	}
+	switch n := v.(type) {
+	case float64:
+		if n <= 0 || n != float64(int(n)) {
+			return 0, fmt.Errorf("invalid pull_request.number: %v", n)
+		}
+		return int(n), nil
+	case string:
+		s := strings.TrimSpace(n)
+		if s == "" {
+			return 0, fmt.Errorf("missing pull_request.number")
+		}
+		var parsed int
+		if _, err := fmt.Sscanf(s, "%d", &parsed); err != nil || parsed <= 0 {
+			return 0, fmt.Errorf("invalid pull_request.number: %v", s)
+		}
+		return parsed, nil
+	default:
+		return 0, fmt.Errorf("invalid pull_request.number type: %T", v)
+	}
 }
 
 func inferInfraPaths(evt WebhookEvent) []string {
-	out := make([]string, 0, len(evt.ChangedFiles)+1)
+	out := make([]string, 0, len(evt.ChangedFiles))
+	seen := map[string]struct{}{}
 	for _, p := range evt.ChangedFiles {
 		pp := filepath.ToSlash(strings.TrimSpace(p))
 		if pp == "" {
 			continue
 		}
-		if strings.HasSuffix(pp, "/infra.yaml") || strings.HasSuffix(pp, "/infra.yml") || pp == "infra.yaml" || pp == "infra.yml" {
-			out = append(out, p)
+		// Generic for POC: consider any yaml/yml from changed_files.
+		if strings.HasSuffix(pp, ".yaml") || strings.HasSuffix(pp, ".yml") {
+			if _, ok := seen[pp]; ok {
+				continue
+			}
+			seen[pp] = struct{}{}
+			out = append(out, pp)
 		}
-	}
-	if len(out) == 0 && strings.TrimSpace(evt.FilePath) != "" {
-		out = append(out, evt.FilePath)
 	}
 	return out
 }
