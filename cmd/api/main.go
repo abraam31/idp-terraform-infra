@@ -454,21 +454,75 @@ func parseWebhookEvent(body []byte) (WebhookEvent, error) {
 	if err != nil {
 		return WebhookEvent{}, err
 	}
-	org := strings.TrimSpace(d.Organization)
-	repo := strings.TrimSpace(d.Repository)
-	if org == "" || repo == "" {
-		return WebhookEvent{}, fmt.Errorf("organization and repository are required")
+	repoFull, err := normalizeRepo(strings.TrimSpace(d.Organization), strings.TrimSpace(d.Repository))
+	if err != nil {
+		return WebhookEvent{}, err
+	}
+	changedFiles, err := normalizeChangedFiles(d.ChangedFiles)
+	if err != nil {
+		return WebhookEvent{}, err
 	}
 	return WebhookEvent{
 		EventName:    strings.TrimSpace(d.EventName),
 		Action:       strings.TrimSpace(d.Action),
 		Source:       strings.TrimSpace(d.Source),
-		Repo:         org + "/" + repo,
+		Repo:         repoFull,
 		PRNumber:     prNum,
 		SHA:          strings.TrimSpace(d.SHA),
 		Ref:          strings.TrimSpace(d.Ref),
-		ChangedFiles: append([]string{}, d.ChangedFiles...),
+		ChangedFiles: changedFiles,
 	}, nil
+}
+
+func normalizeRepo(org, repository string) (string, error) {
+	repo := strings.TrimSpace(repository)
+	if repo == "" {
+		return "", fmt.Errorf("repository is required")
+	}
+	// Accept either "repo-name" or "org/repo-name".
+	if strings.Count(repo, "/") == 1 {
+		return repo, nil
+	}
+	if org == "" {
+		return "", fmt.Errorf("organization is required when repository is not in org/repo form")
+	}
+	if strings.Contains(repo, "/") {
+		return "", fmt.Errorf("invalid repository format: %q", repo)
+	}
+	return org + "/" + repo, nil
+}
+
+func normalizeChangedFiles(in []string) ([]string, error) {
+	// Some senders accidentally pass changed_files as a one-item stringified JSON array.
+	// Accept both:
+	// 1) ["a.yaml","b.yml"]
+	// 2) ["[\"a.yaml\",\"b.yml\"]"]
+	if len(in) == 1 {
+		raw := strings.TrimSpace(in[0])
+		if strings.HasPrefix(raw, "[") && strings.HasSuffix(raw, "]") {
+			var parsed []string
+			if err := json.Unmarshal([]byte(raw), &parsed); err == nil {
+				in = parsed
+			}
+		}
+	}
+	out := make([]string, 0, len(in))
+	seen := map[string]struct{}{}
+	for _, p := range in {
+		pp := filepath.ToSlash(strings.TrimSpace(p))
+		if pp == "" {
+			continue
+		}
+		if _, ok := seen[pp]; ok {
+			continue
+		}
+		seen[pp] = struct{}{}
+		out = append(out, pp)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("changed_files must include at least one path")
+	}
+	return out, nil
 }
 
 func parsePRNumber(v any) (int, error) {
