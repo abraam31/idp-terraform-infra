@@ -316,6 +316,7 @@ func (f GitHubRepoFetcher) FetchFile(ctx context.Context, repo string, _ int, re
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
 	u := fmt.Sprintf("%s/repos/%s/contents/%s?ref=%s", base, repo, encodeGitHubPath(filePath), url.QueryEscape(ref))
+	log.Printf("github fetch attempt repo=%q ref=%q path=%q url=%q", repo, abbrev(ref), filePath, u)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u, nil)
 	if err != nil {
 		return nil, err
@@ -330,7 +331,7 @@ func (f GitHubRepoFetcher) FetchFile(ctx context.Context, repo string, _ int, re
 	defer resp.Body.Close()
 	respBody, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("github api returned %d for %s: %s", resp.StatusCode, filePath, strings.TrimSpace(string(respBody)))
+		return nil, fmt.Errorf("github api %s returned %d for path=%s ref=%s: %s", u, resp.StatusCode, filePath, abbrev(ref), strings.TrimSpace(string(respBody)))
 	}
 	var payload struct {
 		Content  string `json:"content"`
@@ -362,6 +363,13 @@ func encodeGitHubPath(p string) string {
 	return strings.Join(encoded, "/")
 }
 
+func abbrev(s string) string {
+	s = strings.TrimSpace(s)
+	if len(s) <= 8 {
+		return s
+	}
+	return s[:8]
+}
 type SourceAwareFetcher struct {
 	Local  FileFetcher
 	GitHub FileFetcher
@@ -441,14 +449,31 @@ func resolveYAMLInput(
 	log.Printf("webhook parsed event event_name=%q action=%q source=%q repo=%q pr_number=%d changed_files=%d",
 		evt.EventName, evt.Action, evt.Source, evt.Repo, evt.PRNumber, len(evt.ChangedFiles))
 
-	candidates := inferInfraPaths(evt)
-	if b, path, err := eventFetcher.FetchFirst(ctx, evt, candidates); err == nil {
-		log.Printf("webhook yaml source=changed_files path=%q", path)
-		return b, nil
-	}
+	// Log raw changed_files for debugging
+	log.Printf("Body of the webhook: %s", string(body))
+	log.Printf("webhook changed_files raw=%v", evt.ChangedFiles)
 
-	// 3) Final fallback for local MVP
-	return os.ReadFile(samplePath)
+	candidates := inferInfraPaths(evt)
+	// If no YAML-looking candidates but we did receive changed_files, fallback to try all provided paths.
+	if len(candidates) == 0 && len(evt.ChangedFiles) > 0 {
+		log.Printf("webhook no yaml-looking candidates; falling back to try all changed files")
+		candidates = append([]string{}, evt.ChangedFiles...)
+	}
+	log.Printf("webhook candidates count=%d list=%v repo=%q sha=%q ref=%q source=%q",
+		len(candidates), candidates, evt.Repo, abbrev(evt.SHA), evt.Ref, evt.Source)
+	// If explicitly github but no token set, fail fast with clear message
+	if strings.EqualFold(strings.TrimSpace(evt.Source), "github") && strings.TrimSpace(os.Getenv("GITHUB_TOKEN")) == "" {
+		return nil, fmt.Errorf("source=github requested but GITHUB_TOKEN is not configured in API runtime")
+	}
+	if b, path, err := eventFetcher.FetchFirst(ctx, evt, candidates); err == nil {
+		log.Printf("webhook yaml resolved path=%q", path)
+		return b, nil
+	} else if err != nil {
+		log.Printf("webhook fetch_first failed repo=%q sha=%q ref=%q source=%q err=%v",
+			evt.Repo, abbrev(evt.SHA), evt.Ref, evt.Source, err)
+	}
+	// No candidate succeeded for JSON payloads. Do not silently fall back.
+	return nil, fmt.Errorf("no yaml resolved from candidates (source=%s, candidates=%v); ensure files exist and are accessible via selected source", evt.Source, candidates)
 }
 
 func parseWebhookEvent(body []byte) (WebhookEvent, error) {
