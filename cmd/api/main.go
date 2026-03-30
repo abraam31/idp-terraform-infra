@@ -38,6 +38,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize sqs queue: %v", err)
 	}
+	log.Printf("Dummy Line to confirm the build is working")
 	samplePath := getenv("SAMPLE_YAML_PATH", "./sample.yaml")
 	mockRepoRoot := getenv("MOCK_REPO_ROOT", "./mock-repo")
 	localFetcher := LocalRepoFetcher{Root: mockRepoRoot}
