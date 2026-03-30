@@ -418,13 +418,18 @@ func resolveYAMLInput(
 	samplePath string,
 	eventFetcher EventFileFetcher,
 ) ([]byte, error) {
+	// Normalize content type and log branch decision for unambiguous tracing
+	ctLower := strings.ToLower(strings.TrimSpace(contentType))
+	isJSON := strings.Contains(ctLower, "application/json")
+	log.Printf("resolveYAMLInput content_type_seen=%q json_branch=%t", contentType, isJSON)
+
 	// 1) Raw YAML body flow (manual testing / direct API calls)
-	if !strings.Contains(contentType, "application/json") {
+	if !isJSON {
 		trimmed := strings.TrimSpace(string(body))
-		if trimmed != "" {
-			return []byte(trimmed), nil
+		if trimmed == "" {
+			return nil, fmt.Errorf("non-json payload provided with empty body; raw yaml is required for non-json requests (no sample fallback). Body: %s", string(body))
 		}
-		return os.ReadFile(samplePath)
+		return []byte(trimmed), nil
 	}
 
 	// 2) Normal webhook flow (JSON event)
