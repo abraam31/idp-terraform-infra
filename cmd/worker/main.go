@@ -20,7 +20,7 @@ func main() {
 	awsRegion := getenv("AWS_REGION", "us-east-1")
 	queueURL := strings.TrimSpace(os.Getenv("SQS_QUEUE_URL"))
 	if queueURL == "" {
-		log.Fatal("SQS_QUEUE_URL is required")
+		log.Fatal("SQS_QUEUE_URL is required.")
 	}
 	sqsQueue, err := queue.NewSQSQueue(context.Background(), awsRegion, queueURL)
 	if err != nil {
