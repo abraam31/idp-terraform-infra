@@ -3,10 +3,9 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"errors"
-	"io/fs"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"sort"
@@ -33,18 +32,48 @@ func main() {
 	moduleRepo := getenv("TF_MODULE_REPO", "git@github.com:localytics/devops-terraform-modules.git")
 	_ = os.MkdirAll(s3MockRoot, 0o755)
 
-	// Single-shot poll from SQS for MVP worker loop
-	msg, err := sqsQueue.Dequeue(context.Background())
-	if errors.Is(err, fs.ErrNotExist) || msg == nil {
-		log.Println("no jobs in queue; exiting")
-		return
+	go serveHealth()
+	log.Println("worker health endpoint listening on :9000 (/healthz)")
+
+	for {
+		msg, err := sqsQueue.Dequeue(context.Background())
+		if err != nil {
+			log.Printf("read sqs queue: %v", err)
+			time.Sleep(5 * time.Second)
+			continue
+		}
+		if msg == nil {
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		if err := processMessage(msg.Body, s3MockRoot, moduleRepo); err != nil {
+			log.Printf("message processing failed: %v", err)
+			continue
+		}
+		if err := sqsQueue.MarkDone(context.Background(), msg.ReceiptHandle); err != nil {
+			log.Printf("warn: failed to ack message: %v", err)
+			continue
+		}
+		log.Println("worker completed one message")
 	}
-	if err != nil {
-		log.Fatalf("read sqs queue: %v", err)
+}
+
+func serveHealth() {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+	if err := http.ListenAndServe(":9000", mux); err != nil {
+		log.Printf("health server stopped: %v", err)
 	}
+}
+
+func processMessage(body []byte, s3MockRoot string, moduleRepo string) error {
 	var job map[string]any
-	if err := json.Unmarshal(msg.Body, &job); err != nil {
-		log.Fatalf("parse job: %v", err)
+	if err := json.Unmarshal(body, &job); err != nil {
+		return fmt.Errorf("parse job: %w", err)
 	}
 	jobID, _ := job["id"].(string)
 	if jobID == "" {
@@ -57,25 +86,22 @@ func main() {
 
 	outDir := filepath.Join(s3MockRoot, jobID)
 	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		log.Fatalf("mk out dir: %v", err)
+		return fmt.Errorf("mk out dir: %w", err)
 	}
-	// Write spec.json for reference
 	specBytes, _ := json.MarshalIndent(spec, "", "  ")
 	if err := os.WriteFile(filepath.Join(outDir, "spec.json"), specBytes, 0o644); err != nil {
-		log.Fatalf("write spec.json: %v", err)
+		return fmt.Errorf("write spec.json: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(outDir, "backend.tf"), []byte(buildBackendConfig(envName, envCfg, jobID)), 0o644); err != nil {
-		log.Fatalf("write backend.tf: %v", err)
+		return fmt.Errorf("write backend.tf: %w", err)
 	}
 	if err := os.WriteFile(filepath.Join(outDir, "providers.tf"), []byte(buildProviderConfig(envCfg)), 0o644); err != nil {
-		log.Fatalf("write providers.tf: %v", err)
+		return fmt.Errorf("write providers.tf: %w", err)
 	}
 
-	// Build main.tf
 	var mainTf string
 	mainTf = terraformHeader() + "\n"
 	if awsMap != nil {
-		// Dispatch by top-level aws keys (e.g. aws.lb, aws.rds, aws.ec2)
 		for resourceType := range awsMap {
 			switch resourceType {
 			case "lb":
@@ -86,16 +112,24 @@ func main() {
 	if strings.TrimSpace(mainTf) == strings.TrimSpace(terraformHeader()) {
 		mainTf += "# No supported resources found yet. Add aws.lb entries to generate module blocks.\n"
 	}
-	// Write main.tf
 	if err := os.WriteFile(filepath.Join(outDir, "main.tf"), []byte(mainTf), 0o644); err != nil {
-		log.Fatalf("write main.tf: %v", err)
+		return fmt.Errorf("write main.tf: %w", err)
+	}
+
+	// Log generated files for visibility
+	if b, err := os.ReadFile(filepath.Join(outDir, "backend.tf")); err == nil {
+		log.Printf("==== backend.tf (%s) ====\n%s\n==== end backend.tf ====", outDir, string(b))
+	} else {
+		log.Printf("warn: unable to read backend.tf: %v", err)
+	}
+	if b, err := os.ReadFile(filepath.Join(outDir, "main.tf")); err == nil {
+		log.Printf("==== main.tf (%s) ====\n%s\n==== end main.tf ====", outDir, string(b))
+	} else {
+		log.Printf("warn: unable to read main.tf: %v", err)
 	}
 
 	log.Printf("generated terraform in s3-mock dir: %s", outDir)
-	if err := sqsQueue.MarkDone(context.Background(), msg.ReceiptHandle); err != nil {
-		log.Printf("warn: failed to ack message: %v", err)
-	}
-	log.Println("worker completed")
+	return nil
 }
 
 func terraformHeader() string {

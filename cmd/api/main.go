@@ -228,18 +228,14 @@ func resolveEnvConfig(env string) map[string]any {
 	case "prod", "production":
 		return map[string]any{
 			"region":          "us-east-1",
-			"role_arn":        "arn:aws:iam::222222222222:role/idp-terraform-prod",
-			"tf_state_bucket": "idp-tf-state-prod",
-			"tf_lock_table":   "idp-tf-locks-prod",
-			"tf_state_prefix": "workspaces/prod",
+			"tf_state_bucket": "loc-prod-tfstate",
+			"tf_state_prefix": "prod",
 		}
 	default:
 		return map[string]any{
 			"region":          "us-east-1",
-			"role_arn":        "arn:aws:iam::111111111112:role/idp-terraform-sandbox",
-			"tf_state_bucket": "idp-tf-state-sandbox-33",
-			"tf_lock_table":   "idp-tf-locks-sandbox-33",
-			"tf_state_prefix": "workspaces/sandbox",
+			"tf_state_bucket": "loc-staging-tfstate",
+			"tf_state_prefix": "staging",
 		}
 	}
 }
