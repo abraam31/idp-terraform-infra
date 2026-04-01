@@ -27,10 +27,20 @@ func main() {
 		log.Fatalf("init sqs queue: %v", err)
 	}
 
-	artifactsDir := getenv("ARTIFACTS_DIR", "./artifacts")
+	// Ensure writable artifacts root (default to /app/artifacts inside container)
+	artifactsDir := getenv("ARTIFACTS_DIR", "/app/artifacts")
+	if err := os.MkdirAll(artifactsDir, 0o755); err != nil {
+		log.Printf("warn: unable to create artifacts dir %q: %v; falling back to os.TempDir()", artifactsDir, err)
+		artifactsDir = filepath.Join(os.TempDir(), "infra-artifacts")
+		_ = os.MkdirAll(artifactsDir, 0o755)
+	}
 	s3MockRoot := getenv("S3_MOCK_DIR", filepath.Join(artifactsDir, "s3", "tf-code"))
 	moduleRepo := getenv("TF_MODULE_REPO", "git@github.com:localytics/devops-terraform-modules.git")
-	_ = os.MkdirAll(s3MockRoot, 0o755)
+	if err := os.MkdirAll(s3MockRoot, 0o755); err != nil {
+		log.Printf("warn: unable to create s3 mock root %q: %v; attempting fallback under /tmp", s3MockRoot, err)
+		s3MockRoot = filepath.Join(os.TempDir(), "infra-artifacts", "s3", "tf-code")
+		_ = os.MkdirAll(s3MockRoot, 0o755)
+	}
 
 	go serveHealth()
 	log.Println("worker health endpoint listening on :9000 (/healthz)")

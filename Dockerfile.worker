@@ -3,11 +3,14 @@ WORKDIR /src
 COPY go.mod ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/worker ./cmd/worker
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/worker ./cmd/worker && \
+    mkdir -p /out/app-artifacts
 
 FROM gcr.io/distroless/base-debian12
 WORKDIR /app
-COPY --from=build /out/worker /app/worker
+COPY --chown=nonroot:nonroot --from=build /out/worker /app/worker
+COPY --chown=nonroot:nonroot --from=build /out/app-artifacts /app/artifacts
 USER nonroot:nonroot
 ENTRYPOINT ["/app/worker"]
+EXPOSE 9000
 
