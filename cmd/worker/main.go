@@ -7,12 +7,16 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
 	"infra-loc/internal/queue"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 func main() {
@@ -93,12 +97,31 @@ func processMessage(body []byte, resultsRoot string) error {
 		return fmt.Errorf("missing terraform_ref in message payload")
 	}
 
-	info, err := os.Stat(tfRef)
-	if err != nil {
-		return fmt.Errorf("terraform_ref path unavailable: %w", err)
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("terraform_ref is not a directory: %s", tfRef)
+	// Ensure terraform_ref exists locally, otherwise try terraform_s3_ref
+	if info, err := os.Stat(tfRef); err != nil || !info.IsDir() {
+		s3Ref := strings.TrimSpace(asString(job["terraform_s3_ref"]))
+		if s3Ref == "" {
+			return fmt.Errorf("terraform_ref path unavailable: %w", err)
+		}
+		log.Printf("local terraform_ref missing; attempting download from %s", s3Ref)
+		awsRegion := getenv("AWS_REGION", "us-east-1")
+		awsCfg, cfgErr := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(awsRegion))
+		if cfgErr != nil {
+			return fmt.Errorf("init aws config failed: %w", cfgErr)
+		}
+		s3Client := s3.NewFromConfig(awsCfg)
+		bucket, prefix, parseErr := parseS3URL(s3Ref)
+		if parseErr != nil {
+			return parseErr
+		}
+		dlDir := filepath.Join(resultsRoot, jobID, "input")
+		if mkErr := os.MkdirAll(dlDir, 0o755); mkErr != nil {
+			return fmt.Errorf("create download dir: %w", mkErr)
+		}
+		if dlErr := downloadS3PrefixToDir(context.Background(), s3Client, bucket, prefix, dlDir); dlErr != nil {
+			return fmt.Errorf("download from s3 failed: %w", dlErr)
+		}
+		tfRef = dlDir
 	}
 
 	kind := strings.ToLower(strings.TrimSpace(asString(job["kind"])))
@@ -180,6 +203,76 @@ func runCmd(workDir string, name string, args ...string) (string, error) {
 	}
 	return output, err
 }
+
+func parseS3URL(u string) (string, string, error) {
+	// Expect s3://bucket/prefix/
+	s3url := strings.TrimSpace(u)
+	if !strings.HasPrefix(s3url, "s3://") {
+		return "", "", fmt.Errorf("invalid s3 url: %s", s3url)
+	}
+	rest := strings.TrimPrefix(s3url, "s3://")
+	parts := strings.SplitN(rest, "/", 2)
+	if len(parts) == 0 || strings.TrimSpace(parts[0]) == "" {
+		return "", "", fmt.Errorf("invalid s3 url (bucket missing): %s", s3url)
+	}
+	bucket := parts[0]
+	prefix := ""
+	if len(parts) == 2 {
+		prefix = strings.Trim(parts[1], "/")
+	}
+	return bucket, prefix, nil
+}
+
+
+func downloadS3PrefixToDir(ctx context.Context, s3Client *s3.Client, bucket, prefix string, localDir string) error {
+	prefix = strings.Trim(prefix, "/")
+	var continuation *string
+	for {
+		out, err := s3Client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(bucket),
+			Prefix:            aws.String(prefix),
+			ContinuationToken: continuation,
+		})
+		if err != nil {
+			return fmt.Errorf("could not list objects: %w", err)
+		}
+		for _, obj := range out.Contents {
+			key := aws.ToString(obj.Key)
+			if strings.HasSuffix(key, "/") {
+				fmt.Printf("Skipping directory: %s\n", key)
+				continue
+			}
+			rel := strings.TrimPrefix(key, prefix)
+			rel = strings.TrimLeft(rel, "/")
+			target := filepath.Join(localDir, filepath.FromSlash(rel))
+			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+				return fmt.Errorf("could not create directories: %w", err)
+			}
+			downloadOut, downloadErr := s3Client.GetObject(ctx, &s3.GetObjectInput{
+				Bucket: aws.String(bucket),
+				Key:    aws.String(key),
+			})
+			if downloadErr != nil {
+				return fmt.Errorf("could not download object: %w", downloadErr)
+			}
+
+			data, readErr := io.ReadAll(downloadOut.Body)
+			_ = downloadOut.Body.Close()
+			if readErr != nil {
+				return fmt.Errorf("could not read object body: %w", readErr)
+			}
+			if writeErr := os.WriteFile(target, data, 0o644); writeErr != nil {
+				return fmt.Errorf("could not write file: %w", writeErr)
+			}
+		}
+		if !aws.ToBool(out.IsTruncated) || out.NextContinuationToken == nil {
+			break
+		}
+		continuation = out.NextContinuationToken
+	}
+	return nil
+}
+
 
 func asString(v any) string {
 	switch t := v.(type) {

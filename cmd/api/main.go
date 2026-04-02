@@ -164,6 +164,17 @@ func main() {
 			http.Error(w, "failed to render terraform files", http.StatusInternalServerError)
 			return
 		}
+		// Print rendered files for visibility
+		if b, err := os.ReadFile(filepath.Join(jobDir, "backend.tf")); err == nil {
+			log.Printf("==== backend.tf (%s) ====\n%s\n==== end backend.tf ====", jobDir, string(b))
+		} else {
+			log.Printf("warn: unable to read backend.tf: %v", err)
+		}
+		if b, err := os.ReadFile(filepath.Join(jobDir, "main.tf")); err == nil {
+			log.Printf("==== main.tf (%s) ====\n%s\n==== end main.tf ====", jobDir, string(b))
+		} else {
+			log.Printf("warn: unable to read main.tf: %v", err)
+		}
 		out["terraform_ref"] = jobDir
 		// If configured, upload rendered files to S3 and attach a cloud reference as well.
 		if s3Client != nil {
@@ -173,12 +184,17 @@ func main() {
 			} else {
 				s3Prefix = jobID
 			}
-			if err := uploadDirectoryToS3(r.Context(), s3Client, artifactsBucket, s3Prefix, jobDir); err != nil {
-				log.Printf("webhook s3 upload failed request_id=%s job_id=%s err=%v", reqID, jobID, err)
+			log.Printf("webhook s3 upload start request_id=%s job_id=%s bucket=%s prefix=%s dir=%s", reqID, jobID, artifactsBucket, s3Prefix, jobDir)
+			n, err := uploadDirectoryToS3(r.Context(), s3Client, artifactsBucket, s3Prefix, jobDir)
+			if err != nil {
+				log.Printf("webhook s3 upload FAILED request_id=%s job_id=%s bucket=%s prefix=%s err=%v", reqID, jobID, artifactsBucket, s3Prefix, err)
 				// Do not fail the request; local ref still valid.
 			} else {
+				log.Printf("webhook s3 upload success request_id=%s job_id=%s uploaded_files=%d s3=%s/%s", reqID, jobID, n, artifactsBucket, s3Prefix)
 				out["terraform_s3_ref"] = fmt.Sprintf("s3://%s/%s/", artifactsBucket, s3Prefix)
 			}
+		} else {
+			log.Printf("webhook s3 upload skipped request_id=%s job_id=%s reason=s3_not_configured", reqID, jobID)
 		}
 		b, _ := json.MarshalIndent(out, "", "  ")
 		if _, err := sqsQueue.Enqueue(r.Context(), "plan", b); err != nil {
@@ -844,8 +860,9 @@ func sanitizeModuleName(name string) string {
 	return out
 }
 
-func uploadDirectoryToS3(ctx context.Context, s3Client *s3.Client, bucket, prefix, localDir string) error {
+func uploadDirectoryToS3(ctx context.Context, s3Client *s3.Client, bucket, prefix, localDir string) (int, error) {
 	prefix = strings.Trim(prefix, "/")
+	count := 0
 	errWalk := filepath.Walk(localDir, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
@@ -888,9 +905,13 @@ func uploadDirectoryToS3(ctx context.Context, s3Client *s3.Client, bucket, prefi
 		if err != nil {
 			return fmt.Errorf("upload %s to s3://%s/%s: %w", path, bucket, key, err)
 		}
+		count++
 		return nil
 	})
-	return errWalk
+	if errWalk != nil {
+		return count, errWalk
+	}
+	return count, nil
 }
 
 // bytesReader wraps a byte slice for io.Reader without extra allocations.
