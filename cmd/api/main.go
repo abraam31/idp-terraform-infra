@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +21,11 @@ import (
 	"infra-loc/internal/queue"
 
 	"gopkg.in/yaml.v3"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	awsconfig "github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"bytes"
 )
 
 func main() {
@@ -30,6 +36,8 @@ func main() {
 	if queueURL == "" {
 		log.Fatal("SQS_QUEUE_URL is required")
 	}
+	artifactsBucket := strings.TrimSpace(os.Getenv("ARTIFACTS_BUCKET"))
+	artifactsPrefix := strings.Trim(strings.TrimSpace(getenv("ARTIFACTS_PREFIX", "jobs")), "/")
 	apiToken := strings.TrimSpace(os.Getenv("IDP_API_TOKEN"))
 	if apiToken == "" {
 		log.Fatal("IDP_API_TOKEN is required")
@@ -38,8 +46,26 @@ func main() {
 	if err != nil {
 		log.Fatalf("failed to initialize sqs queue: %v", err)
 	}
+	// Optional S3 client (only if bucket is configured)
+	var s3Client *s3.Client
+	if artifactsBucket != "" {
+		awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(), awsconfig.WithRegion(awsRegion))
+		if err != nil {
+			log.Fatalf("failed to init aws config for s3: %v", err)
+		}
+		s3Client = s3.NewFromConfig(awsCfg)
+		log.Printf("s3 uploader enabled bucket=%q prefix=%q", artifactsBucket, artifactsPrefix)
+	} else {
+		log.Printf("s3 uploader disabled: ARTIFACTS_BUCKET not set")
+	}
 	log.Printf("Dummy Line to confirm the build is working")
 	samplePath := getenv("SAMPLE_YAML_PATH", "./sample.yaml")
+	artifactsDir := getenv("ARTIFACTS_DIR", "/app/artifacts")
+	tfRenderRoot := getenv("TF_RENDER_DIR", filepath.Join(artifactsDir, "jobs"))
+	moduleRepo := getenv("TF_MODULE_REPO", "git@github.com:localytics/devops-terraform-modules.git")
+	if err := os.MkdirAll(tfRenderRoot, 0o755); err != nil {
+		log.Fatalf("failed to create TF_RENDER_DIR %q: %v", tfRenderRoot, err)
+	}
 	mockRepoRoot := getenv("MOCK_REPO_ROOT", "./mock-repo")
 	localFetcher := LocalRepoFetcher{Root: mockRepoRoot}
 	var githubFetcher FileFetcher
@@ -130,7 +156,29 @@ func main() {
 			"filename":   "from-pr.yaml",
 			"env":        envName,
 			"env_config": envCfg,
-			"spec":       specMap,
+			"spec":       specMap, // kept for traceability/debugging
+		}
+		jobDir, err := renderTerraformFiles(tfRenderRoot, jobID, envName, envCfg, specMap, moduleRepo)
+		if err != nil {
+			log.Printf("webhook render failed request_id=%s job_id=%s err=%v", reqID, jobID, err)
+			http.Error(w, "failed to render terraform files", http.StatusInternalServerError)
+			return
+		}
+		out["terraform_ref"] = jobDir
+		// If configured, upload rendered files to S3 and attach a cloud reference as well.
+		if s3Client != nil {
+			s3Prefix := artifactsPrefix
+			if s3Prefix != "" {
+				s3Prefix = s3Prefix + "/" + jobID
+			} else {
+				s3Prefix = jobID
+			}
+			if err := uploadDirectoryToS3(r.Context(), s3Client, artifactsBucket, s3Prefix, jobDir); err != nil {
+				log.Printf("webhook s3 upload failed request_id=%s job_id=%s err=%v", reqID, jobID, err)
+				// Do not fail the request; local ref still valid.
+			} else {
+				out["terraform_s3_ref"] = fmt.Sprintf("s3://%s/%s/", artifactsBucket, s3Prefix)
+			}
 		}
 		b, _ := json.MarshalIndent(out, "", "  ")
 		if _, err := sqsQueue.Enqueue(r.Context(), "plan", b); err != nil {
@@ -595,4 +643,257 @@ func inferInfraPaths(evt WebhookEvent) []string {
 		}
 	}
 	return out
+}
+
+func renderTerraformFiles(tfRenderRoot, jobID, envName string, envCfg, spec map[string]any, moduleRepo string) (string, error) {
+	outDir := filepath.Join(tfRenderRoot, jobID)
+	if err := os.MkdirAll(outDir, 0o755); err != nil {
+		return "", fmt.Errorf("mk out dir: %w", err)
+	}
+	specBytes, _ := json.MarshalIndent(spec, "", "  ")
+	if err := os.WriteFile(filepath.Join(outDir, "spec.json"), specBytes, 0o644); err != nil {
+		return "", fmt.Errorf("write spec.json: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "backend.tf"), []byte(buildBackendConfig(envName, envCfg, jobID)), 0o644); err != nil {
+		return "", fmt.Errorf("write backend.tf: %w", err)
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "providers.tf"), []byte(buildProviderConfig(envCfg)), 0o644); err != nil {
+		return "", fmt.Errorf("write providers.tf: %w", err)
+	}
+
+	awsMap, _ := spec["aws"].(map[string]any)
+	mainTf := terraformHeader() + "\n"
+	if awsMap != nil {
+		for resourceType := range awsMap {
+			switch resourceType {
+			case "lb":
+				mainTf += renderLBModules(awsMap, moduleRepo)
+			}
+		}
+	}
+	if strings.TrimSpace(mainTf) == strings.TrimSpace(terraformHeader()) {
+		mainTf += "# No supported resources found yet. Add aws.lb entries to generate module blocks.\n"
+	}
+	if err := os.WriteFile(filepath.Join(outDir, "main.tf"), []byte(mainTf), 0o644); err != nil {
+		return "", fmt.Errorf("write main.tf: %w", err)
+	}
+	return outDir, nil
+}
+
+func terraformHeader() string {
+	return `terraform {
+  required_version = ">= 1.5.0"
+}
+`
+}
+
+func buildBackendConfig(envName string, envCfg map[string]any, jobID string) string {
+	var out strings.Builder
+	bucket := asString(envCfg["tf_state_bucket"])
+	lockTable := asString(envCfg["tf_lock_table"])
+	prefix := strings.Trim(asString(envCfg["tf_state_prefix"]), "/")
+	if prefix == "" {
+		prefix = "workspaces/" + strings.ToLower(envName)
+	}
+	key := prefix + "/" + jobID + "/terraform.tfstate"
+	region := asString(envCfg["region"])
+	if region == "" {
+		region = "us-east-1"
+	}
+	out.WriteString("terraform {\n")
+	out.WriteString("  backend \"s3\" {\n")
+	out.WriteString(fmt.Sprintf("    bucket         = %q\n", bucket))
+	out.WriteString(fmt.Sprintf("    key            = %q\n", key))
+	out.WriteString(fmt.Sprintf("    region         = %q\n", region))
+	out.WriteString(fmt.Sprintf("    dynamodb_table = %q\n", lockTable))
+	out.WriteString("    encrypt        = true\n")
+	out.WriteString("  }\n")
+	out.WriteString("}\n")
+	return out.String()
+}
+
+func buildProviderConfig(envCfg map[string]any) string {
+	region := asString(envCfg["region"])
+	if region == "" {
+		region = "us-east-1"
+	}
+	roleArn := asString(envCfg["role_arn"])
+	var out strings.Builder
+	out.WriteString("provider \"aws\" {\n")
+	out.WriteString(fmt.Sprintf("  region = %q\n", region))
+	if roleArn != "" {
+		out.WriteString("  assume_role {\n")
+		out.WriteString(fmt.Sprintf("    role_arn = %q\n", roleArn))
+		out.WriteString("  }\n")
+	}
+	out.WriteString("}\n")
+	return out.String()
+}
+
+func renderLBModules(awsMap map[string]any, moduleRepo string) string {
+	if len(awsMap) == 0 {
+		return ""
+	}
+	lbRaw, ok := awsMap["lb"]
+	if !ok {
+		return ""
+	}
+	lbs, ok := lbRaw.([]any)
+	if !ok {
+		return ""
+	}
+	var out strings.Builder
+	for _, item := range lbs {
+		lb, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		name := asString(lb["name"])
+		if name == "" {
+			continue
+		}
+		lbType := asString(lb["type"])
+		modulePath := "clb"
+		if strings.EqualFold(lbType, "application") || strings.EqualFold(lbType, "alb") {
+			modulePath = "alb"
+		}
+		healthType := asString(lb["health-check-type"])
+		healthPort := asString(lb["health-check-port"])
+		if healthPort == "" {
+			if n, ok := lb["health-check-port"].(float64); ok {
+				healthPort = fmt.Sprintf("%.0f", n)
+			}
+		}
+		health := strings.Trim(strings.TrimSpace(healthType)+":"+strings.TrimSpace(healthPort), ":")
+		sg := toStringSlice(lb["security-group-id"], lb["security-group-ids"])
+		subnets := toStringSlice(lb["subnets"])
+		sort.Strings(subnets)
+		modName := sanitizeModuleName(name)
+		out.WriteString(fmt.Sprintf("module %q {\n", modName))
+		out.WriteString(fmt.Sprintf("  source            = %q\n", moduleRepo+"//"+modulePath+"?ref=master"))
+		out.WriteString(fmt.Sprintf("  name              = %q\n", name))
+		if len(sg) > 0 {
+			out.WriteString(fmt.Sprintf("  security_groups   = %s\n", tfList(sg)))
+		}
+		if len(subnets) > 0 {
+			out.WriteString(fmt.Sprintf("  subnets           = %s\n", tfList(subnets)))
+		}
+		if health != "" {
+			out.WriteString(fmt.Sprintf("  health_check_path = %q\n", health))
+		}
+		out.WriteString("}\n\n")
+	}
+	return out.String()
+}
+
+func toStringSlice(v ...any) []string {
+	var out []string
+	for _, one := range v {
+		switch t := one.(type) {
+		case string:
+			if t != "" {
+				out = append(out, t)
+			}
+		case []any:
+			for _, e := range t {
+				if s, ok := e.(string); ok && s != "" {
+					out = append(out, s)
+				}
+			}
+		}
+	}
+	return out
+}
+
+func tfList(items []string) string {
+	if len(items) == 0 {
+		return "[]"
+	}
+	quoted := make([]string, 0, len(items))
+	for _, it := range items {
+		quoted = append(quoted, fmt.Sprintf("%q", it))
+	}
+	return "[" + strings.Join(quoted, ", ") + "]"
+}
+
+func asString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		return fmt.Sprintf("%.0f", t)
+	default:
+		return ""
+	}
+}
+
+func sanitizeModuleName(name string) string {
+	name = strings.ToLower(name)
+	name = strings.ReplaceAll(name, " ", "-")
+	name = strings.ReplaceAll(name, "_", "-")
+	var b strings.Builder
+	for _, r := range name {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
+			b.WriteRune(r)
+		}
+	}
+	out := b.String()
+	if out == "" {
+		return "generated-lb"
+	}
+	return out
+}
+
+func uploadDirectoryToS3(ctx context.Context, s3Client *s3.Client, bucket, prefix, localDir string) error {
+	prefix = strings.Trim(prefix, "/")
+	errWalk := filepath.Walk(localDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(localDir, path)
+		if err != nil {
+			return err
+		}
+		key := rel
+		if prefix != "" {
+			key = prefix + "/" + filepath.ToSlash(rel)
+		} else {
+			key = filepath.ToSlash(rel)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		var contentType *string
+		switch {
+		case strings.HasSuffix(strings.ToLower(path), ".tf"):
+			ct := "text/plain"
+			contentType = &ct
+		case strings.HasSuffix(strings.ToLower(path), ".json"):
+			ct := "application/json"
+			contentType = &ct
+		default:
+			// let S3 infer or default; leaving nil
+		}
+		_, err = s3Client.PutObject(ctx, &s3.PutObjectInput{
+			Bucket:      aws.String(bucket),
+			Key:         aws.String(key),
+			Body:        bytesReader(data),
+			ContentType: contentType,
+			ACL:         types.ObjectCannedACLPrivate,
+		})
+		if err != nil {
+			return fmt.Errorf("upload %s to s3://%s/%s: %w", path, bucket, key, err)
+		}
+		return nil
+	})
+	return errWalk
+}
+
+// bytesReader wraps a byte slice for io.Reader without extra allocations.
+func bytesReader(b []byte) io.Reader {
+	return bytes.NewReader(b)
 }

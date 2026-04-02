@@ -7,8 +7,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -34,12 +34,11 @@ func main() {
 		artifactsDir = filepath.Join(os.TempDir(), "infra-artifacts")
 		_ = os.MkdirAll(artifactsDir, 0o755)
 	}
-	s3MockRoot := getenv("S3_MOCK_DIR", filepath.Join(artifactsDir, "s3", "tf-code"))
-	moduleRepo := getenv("TF_MODULE_REPO", "git@github.com:localytics/devops-terraform-modules.git")
-	if err := os.MkdirAll(s3MockRoot, 0o755); err != nil {
-		log.Printf("warn: unable to create s3 mock root %q: %v; attempting fallback under /tmp", s3MockRoot, err)
-		s3MockRoot = filepath.Join(os.TempDir(), "infra-artifacts", "s3", "tf-code")
-		_ = os.MkdirAll(s3MockRoot, 0o755)
+	resultsRoot := getenv("TF_RESULTS_DIR", filepath.Join(artifactsDir, "results"))
+	if err := os.MkdirAll(resultsRoot, 0o755); err != nil {
+		log.Printf("warn: unable to create TF_RESULTS_DIR %q: %v; attempting fallback under /tmp", resultsRoot, err)
+		resultsRoot = filepath.Join(os.TempDir(), "infra-artifacts", "results")
+		_ = os.MkdirAll(resultsRoot, 0o755)
 	}
 
 	go serveHealth()
@@ -57,7 +56,7 @@ func main() {
 			continue
 		}
 
-		if err := processMessage(msg.Body, s3MockRoot, moduleRepo); err != nil {
+		if err := processMessage(msg.Body, resultsRoot); err != nil {
 			log.Printf("message processing failed: %v", err)
 			continue
 		}
@@ -80,7 +79,7 @@ func serveHealth() {
 	}
 }
 
-func processMessage(body []byte, s3MockRoot string, moduleRepo string) error {
+func processMessage(body []byte, resultsRoot string) error {
 	var job map[string]any
 	if err := json.Unmarshal(body, &job); err != nil {
 		return fmt.Errorf("parse job: %w", err)
@@ -89,195 +88,97 @@ func processMessage(body []byte, s3MockRoot string, moduleRepo string) error {
 	if jobID == "" {
 		jobID = time.Now().UTC().Format("20060102T150405Z0700")
 	}
-	spec, _ := job["spec"].(map[string]any)
-	awsMap, _ := spec["aws"].(map[string]any)
-	envName, _ := job["env"].(string)
-	envCfg, _ := job["env_config"].(map[string]any)
-
-	outDir := filepath.Join(s3MockRoot, jobID)
-	if err := os.MkdirAll(outDir, 0o755); err != nil {
-		return fmt.Errorf("mk out dir: %w", err)
-	}
-	specBytes, _ := json.MarshalIndent(spec, "", "  ")
-	if err := os.WriteFile(filepath.Join(outDir, "spec.json"), specBytes, 0o644); err != nil {
-		return fmt.Errorf("write spec.json: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(outDir, "backend.tf"), []byte(buildBackendConfig(envName, envCfg, jobID)), 0o644); err != nil {
-		return fmt.Errorf("write backend.tf: %w", err)
-	}
-	if err := os.WriteFile(filepath.Join(outDir, "providers.tf"), []byte(buildProviderConfig(envCfg)), 0o644); err != nil {
-		return fmt.Errorf("write providers.tf: %w", err)
+	tfRef := strings.TrimSpace(asString(job["terraform_ref"]))
+	if tfRef == "" {
+		return fmt.Errorf("missing terraform_ref in message payload")
 	}
 
-	var mainTf string
-	mainTf = terraformHeader() + "\n"
-	if awsMap != nil {
-		for resourceType := range awsMap {
-			switch resourceType {
-			case "lb":
-				mainTf += renderLBModules(awsMap, moduleRepo)
-			}
-		}
+	info, err := os.Stat(tfRef)
+	if err != nil {
+		return fmt.Errorf("terraform_ref path unavailable: %w", err)
 	}
-	if strings.TrimSpace(mainTf) == strings.TrimSpace(terraformHeader()) {
-		mainTf += "# No supported resources found yet. Add aws.lb entries to generate module blocks.\n"
+	if !info.IsDir() {
+		return fmt.Errorf("terraform_ref is not a directory: %s", tfRef)
 	}
-	if err := os.WriteFile(filepath.Join(outDir, "main.tf"), []byte(mainTf), 0o644); err != nil {
-		return fmt.Errorf("write main.tf: %w", err)
+
+	kind := strings.ToLower(strings.TrimSpace(asString(job["kind"])))
+	if kind == "" {
+		kind = "plan"
 	}
+	log.Printf("processing job_id=%s kind=%s terraform_ref=%s", jobID, kind, tfRef)
 
 	// Log generated files for visibility
-	if b, err := os.ReadFile(filepath.Join(outDir, "backend.tf")); err == nil {
-		log.Printf("==== backend.tf (%s) ====\n%s\n==== end backend.tf ====", outDir, string(b))
+	if b, err := os.ReadFile(filepath.Join(tfRef, "backend.tf")); err == nil {
+		log.Printf("==== backend.tf (%s) ====\n%s\n==== end backend.tf ====", tfRef, string(b))
 	} else {
 		log.Printf("warn: unable to read backend.tf: %v", err)
 	}
-	if b, err := os.ReadFile(filepath.Join(outDir, "main.tf")); err == nil {
-		log.Printf("==== main.tf (%s) ====\n%s\n==== end main.tf ====", outDir, string(b))
+	if b, err := os.ReadFile(filepath.Join(tfRef, "main.tf")); err == nil {
+		log.Printf("==== main.tf (%s) ====\n%s\n==== end main.tf ====", tfRef, string(b))
 	} else {
 		log.Printf("warn: unable to read main.tf: %v", err)
 	}
 
-	log.Printf("generated terraform in s3-mock dir: %s", outDir)
+	jobResultDir := filepath.Join(resultsRoot, jobID)
+	if err := os.MkdirAll(jobResultDir, 0o755); err != nil {
+		return fmt.Errorf("create result dir: %w", err)
+	}
+
+	if err := runTerraform(tfRef, kind, jobResultDir); err != nil {
+		return err
+	}
+
+	log.Printf("terraform finished job_id=%s result_dir=%s", jobID, jobResultDir)
 	return nil
 }
 
-func terraformHeader() string {
-	return `terraform {
-  required_version = ">= 1.5.0"
-}
-`
-}
-
-func buildBackendConfig(envName string, envCfg map[string]any, jobID string) string {
-	var out strings.Builder
-	bucket := asString(envCfg["tf_state_bucket"])
-	lockTable := asString(envCfg["tf_lock_table"])
-	prefix := strings.Trim(asString(envCfg["tf_state_prefix"]), "/")
-	if prefix == "" {
-		prefix = "workspaces/" + strings.ToLower(envName)
+func runTerraform(workDir, kind, resultDir string) error {
+	initOut, err := runCmd(workDir, "terraform", "init", "-input=false", "-no-color")
+	if writeErr := os.WriteFile(filepath.Join(resultDir, "terraform-init.log"), []byte(initOut), 0o644); writeErr != nil {
+		log.Printf("warn: failed to write terraform-init.log: %v", writeErr)
 	}
-	key := prefix + "/" + jobID + "/terraform.tfstate"
-	region := asString(envCfg["region"])
-	if region == "" {
-		region = "us-east-1"
-	}
-	out.WriteString("terraform {\n")
-	out.WriteString("  backend \"s3\" {\n")
-	out.WriteString(fmt.Sprintf("    bucket         = %q\n", bucket))
-	out.WriteString(fmt.Sprintf("    key            = %q\n", key))
-	out.WriteString(fmt.Sprintf("    region         = %q\n", region))
-	out.WriteString(fmt.Sprintf("    dynamodb_table = %q\n", lockTable))
-	out.WriteString("    encrypt        = true\n")
-	out.WriteString("  }\n")
-	out.WriteString("}\n")
-	return out.String()
-}
-
-func buildProviderConfig(envCfg map[string]any) string {
-	region := asString(envCfg["region"])
-	if region == "" {
-		region = "us-east-1"
-	}
-	roleArn := asString(envCfg["role_arn"])
-	var out strings.Builder
-	out.WriteString("provider \"aws\" {\n")
-	out.WriteString(fmt.Sprintf("  region = %q\n", region))
-	if roleArn != "" {
-		out.WriteString("  assume_role {\n")
-		out.WriteString(fmt.Sprintf("    role_arn = %q\n", roleArn))
-		out.WriteString("  }\n")
-	}
-	out.WriteString("}\n")
-	return out.String()
-}
-func renderLBModules(awsMap map[string]any, moduleRepo string) string {
-	if len(awsMap) == 0 {
-		return ""
-	}
-	lbRaw, ok := awsMap["lb"]
-	if !ok {
-		return ""
-	}
-	lbs, ok := lbRaw.([]any)
-	if !ok {
-		return ""
+	if err != nil {
+		return fmt.Errorf("terraform init failed: %w", err)
 	}
 
-	var out strings.Builder
-	for _, item := range lbs {
-		lb, ok := item.(map[string]any)
-		if !ok {
-			continue
+	switch kind {
+	case "apply":
+		applyOut, applyErr := runCmd(workDir, "terraform", "apply", "-auto-approve", "-input=false", "-no-color")
+		if writeErr := os.WriteFile(filepath.Join(resultDir, "terraform-apply.log"), []byte(applyOut), 0o644); writeErr != nil {
+			log.Printf("warn: failed to write terraform-apply.log: %v", writeErr)
 		}
-		name := asString(lb["name"])
-		if name == "" {
-			continue
+		if applyErr != nil {
+			return fmt.Errorf("terraform apply failed: %w", applyErr)
 		}
-		lbType := asString(lb["type"])
-		modulePath := "clb"
-		if strings.EqualFold(lbType, "application") || strings.EqualFold(lbType, "alb") {
-			modulePath = "alb"
+	default:
+		planOut, planErr := runCmd(workDir, "terraform", "plan", "-input=false", "-no-color", "-out=tfplan.bin")
+		if writeErr := os.WriteFile(filepath.Join(resultDir, "terraform-plan.log"), []byte(planOut), 0o644); writeErr != nil {
+			log.Printf("warn: failed to write terraform-plan.log: %v", writeErr)
 		}
-		healthType := asString(lb["health-check-type"])
-		healthPort := asString(lb["health-check-port"])
-		if healthPort == "" {
-			if n, ok := lb["health-check-port"].(float64); ok {
-				healthPort = fmt.Sprintf("%.0f", n)
-			}
+		if planErr != nil {
+			return fmt.Errorf("terraform plan failed: %w", planErr)
 		}
-		health := strings.Trim(strings.TrimSpace(healthType)+":"+strings.TrimSpace(healthPort), ":")
-
-		sg := toStringSlice(lb["security-group-id"], lb["security-group-ids"])
-		subnets := toStringSlice(lb["subnets"])
-		sort.Strings(subnets)
-
-		modName := sanitizeModuleName(name)
-		out.WriteString(fmt.Sprintf("module %q {\n", modName))
-		out.WriteString(fmt.Sprintf("  source            = %q\n", moduleRepo+"//"+modulePath+"?ref=master"))
-		out.WriteString(fmt.Sprintf("  name              = %q\n", name))
-		if len(sg) > 0 {
-			out.WriteString(fmt.Sprintf("  security_groups   = %s\n", tfList(sg)))
+		showOut, showErr := runCmd(workDir, "terraform", "show", "-no-color", "tfplan.bin")
+		if writeErr := os.WriteFile(filepath.Join(resultDir, "terraform-plan.txt"), []byte(showOut), 0o644); writeErr != nil {
+			log.Printf("warn: failed to write terraform-plan.txt: %v", writeErr)
 		}
-		if len(subnets) > 0 {
-			out.WriteString(fmt.Sprintf("  subnets           = %s\n", tfList(subnets)))
+		if showErr != nil {
+			return fmt.Errorf("terraform show failed: %w", showErr)
 		}
-		if health != "" {
-			out.WriteString(fmt.Sprintf("  health_check_path = %q\n", health))
-		}
-		out.WriteString("}\n\n")
 	}
-	return out.String()
+	return nil
 }
 
-func toStringSlice(v ...any) []string {
-	var out []string
-	for _, one := range v {
-		switch t := one.(type) {
-		case string:
-			if t != "" {
-				out = append(out, t)
-			}
-		case []any:
-			for _, e := range t {
-				if s, ok := e.(string); ok && s != "" {
-					out = append(out, s)
-				}
-			}
-		}
+func runCmd(workDir string, name string, args ...string) (string, error) {
+	log.Printf("running command: %s %s (cwd=%s)", name, strings.Join(args, " "), workDir)
+	cmd := exec.Command(name, args...)
+	cmd.Dir = workDir
+	out, err := cmd.CombinedOutput()
+	output := string(out)
+	if strings.TrimSpace(output) != "" {
+		log.Printf("command output (%s):\n%s", name, output)
 	}
-	return out
-}
-
-func tfList(items []string) string {
-	if len(items) == 0 {
-		return "[]"
-	}
-	quoted := make([]string, 0, len(items))
-	for _, it := range items {
-		quoted = append(quoted, fmt.Sprintf("%q", it))
-	}
-	return "[" + strings.Join(quoted, ", ") + "]"
+	return output, err
 }
 
 func asString(v any) string {
@@ -289,23 +190,6 @@ func asString(v any) string {
 	default:
 		return ""
 	}
-}
-
-func sanitizeModuleName(name string) string {
-	name = strings.ToLower(name)
-	name = strings.ReplaceAll(name, " ", "-")
-	name = strings.ReplaceAll(name, "_", "-")
-	var b strings.Builder
-	for _, r := range name {
-		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') || r == '-' {
-			b.WriteRune(r)
-		}
-	}
-	out := b.String()
-	if out == "" {
-		return "generated-lb"
-	}
-	return out
 }
 
 func getenv(key, def string) string {
