@@ -1,9 +1,8 @@
 name: Build and Push ECR
 
+# Release workflow: pushes images to Amazon ECR. Runs on demand on a runner
+# that has AWS credentials (e.g. a self-hosted runner with an instance role).
 on:
-  push:
-    branches: [master]
-  pull_request:
   workflow_dispatch:
 
 permissions:

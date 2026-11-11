@@ -1,16 +1,16 @@
 FROM golang:1.24-alpine AS build
 WORKDIR /src
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/worker ./cmd/worker && \
-    mkdir -p /out/app-artifacts
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags="-s -w" -o /out/worker ./cmd/worker
 
-FROM gcr.io/distroless/base-debian12
+# The worker shells out to `terraform` (and terraform needs git/ssh to fetch
+# module sources), so the runtime image is based on the official terraform image.
+FROM hashicorp/terraform:1.9.8
+RUN adduser -D -u 65532 nonroot && mkdir -p /app/artifacts && chown -R nonroot:nonroot /app
 WORKDIR /app
 COPY --chown=nonroot:nonroot --from=build /out/worker /app/worker
-COPY --chown=nonroot:nonroot --from=build /out/app-artifacts /app/artifacts
 USER nonroot:nonroot
-ENTRYPOINT ["/app/worker"]
 EXPOSE 9000
-
+ENTRYPOINT ["/app/worker"]

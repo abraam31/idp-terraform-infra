@@ -3,20 +3,22 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
-	"io"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"infra-loc/internal/queue"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"infra-loc/internal/queue"
 )
 
 func main() {
@@ -50,6 +52,9 @@ func main() {
 
 	for {
 		msg, err := sqsQueue.Dequeue(context.Background())
+		if errors.Is(err, fs.ErrNotExist) {
+			continue // queue empty; Dequeue already long-polled
+		}
 		if err != nil {
 			log.Printf("read sqs queue: %v", err)
 			time.Sleep(5 * time.Second)
@@ -223,7 +228,6 @@ func parseS3URL(u string) (string, string, error) {
 	return bucket, prefix, nil
 }
 
-
 func downloadS3PrefixToDir(ctx context.Context, s3Client *s3.Client, bucket, prefix string, localDir string) error {
 	prefix = strings.Trim(prefix, "/")
 	var continuation *string
@@ -273,7 +277,6 @@ func downloadS3PrefixToDir(ctx context.Context, s3Client *s3.Client, bucket, pre
 	return nil
 }
 
-
 func asString(v any) string {
 	switch t := v.(type) {
 	case string:
@@ -291,4 +294,3 @@ func getenv(key, def string) string {
 	}
 	return def
 }
-

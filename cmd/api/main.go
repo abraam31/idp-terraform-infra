@@ -20,12 +20,12 @@ import (
 
 	"infra-loc/internal/queue"
 
-	"gopkg.in/yaml.v3"
+	"bytes"
 	"github.com/aws/aws-sdk-go-v2/aws"
 	awsconfig "github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
-	"bytes"
+	"gopkg.in/yaml.v3"
 )
 
 func main() {
@@ -58,11 +58,10 @@ func main() {
 	} else {
 		log.Printf("s3 uploader disabled: ARTIFACTS_BUCKET not set")
 	}
-	log.Printf("Dummy Line to confirm the build is working")
 	samplePath := getenv("SAMPLE_YAML_PATH", "./sample.yaml")
 	artifactsDir := getenv("ARTIFACTS_DIR", "/app/artifacts")
 	tfRenderRoot := getenv("TF_RENDER_DIR", filepath.Join(artifactsDir, "jobs"))
-	moduleRepo := getenv("TF_MODULE_REPO", "git@github.com:localytics/devops-terraform-modules.git")
+	moduleRepo := getenv("TF_MODULE_REPO", "git@github.com:your-org/terraform-modules.git")
 	if err := os.MkdirAll(tfRenderRoot, 0o755); err != nil {
 		log.Fatalf("failed to create TF_RENDER_DIR %q: %v", tfRenderRoot, err)
 	}
@@ -292,13 +291,13 @@ func resolveEnvConfig(env string) map[string]any {
 	case "prod", "production":
 		return map[string]any{
 			"region":          "us-east-1",
-			"tf_state_bucket": "loc-prod-tfstate",
+			"tf_state_bucket": "idp-prod-tfstate",
 			"tf_state_prefix": "prod",
 		}
 	default:
 		return map[string]any{
 			"region":          "us-east-1",
-			"tf_state_bucket": "loc-staging-tfstate",
+			"tf_state_bucket": "idp-staging-tfstate",
 			"tf_state_prefix": "staging",
 		}
 	}
@@ -318,14 +317,14 @@ type WebhookEvent struct {
 // DownstreamEvent represents the new JSON schema sent by the GitHub Action.
 // This replaces the previous POC shape. No backward compatibility is kept.
 type DownstreamEvent struct {
-	EventName    string            `json:"event_name"`
-	Action       string            `json:"action"`
-	Source       string            `json:"source"` // github | local | auto (default)
-	Repository   string            `json:"repository"`
-	Organization string            `json:"organization"`
-	SHA          string            `json:"sha"`
-	Ref          string            `json:"ref"`
-	Actor        string            `json:"actor"`
+	EventName    string         `json:"event_name"`
+	Action       string         `json:"action"`
+	Source       string         `json:"source"` // github | local | auto (default)
+	Repository   string         `json:"repository"`
+	Organization string         `json:"organization"`
+	SHA          string         `json:"sha"`
+	Ref          string         `json:"ref"`
+	Actor        string         `json:"actor"`
 	Run          map[string]any `json:"run"` // contains id, attempt
 	PullRequest  struct {
 		Number any    `json:"number"`
@@ -430,6 +429,7 @@ func abbrev(s string) string {
 	}
 	return s[:8]
 }
+
 type SourceAwareFetcher struct {
 	Local  FileFetcher
 	GitHub FileFetcher
@@ -838,6 +838,8 @@ func asString(v any) string {
 		return t
 	case float64:
 		return fmt.Sprintf("%.0f", t)
+	case int:
+		return fmt.Sprintf("%d", t)
 	default:
 		return ""
 	}

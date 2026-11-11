@@ -5,4 +5,3 @@ package types
 type RootSpec struct {
 	Aws map[string]any `yaml:"aws" json:"aws"`
 }
-
