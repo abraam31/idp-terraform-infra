@@ -61,7 +61,11 @@ func main() {
 	samplePath := getenv("SAMPLE_YAML_PATH", "./sample.yaml")
 	artifactsDir := getenv("ARTIFACTS_DIR", "/app/artifacts")
 	tfRenderRoot := getenv("TF_RENDER_DIR", filepath.Join(artifactsDir, "jobs"))
+<<<<<<< CURRENT (yours)
 	moduleRepo := getenv("TF_MODULE_REPO", "git@github.com:your-org/terraform-modules.git")
+=======
+	moduleRepo := getenv("TF_MODULE_REPO", "git::https://github.com/abraam31/terraform-modules.git")
+>>>>>>> PROPOSED (Claude)
 	if err := os.MkdirAll(tfRenderRoot, 0o755); err != nil {
 		log.Fatalf("failed to create TF_RENDER_DIR %q: %v", tfRenderRoot, err)
 	}
@@ -786,7 +790,11 @@ func renderLBModules(awsMap map[string]any, moduleRepo string) string {
 		sort.Strings(subnets)
 		modName := sanitizeModuleName(name)
 		out.WriteString(fmt.Sprintf("module %q {\n", modName))
+<<<<<<< CURRENT (yours)
 		out.WriteString(fmt.Sprintf("  source            = %q\n", moduleRepo+"//"+modulePath+"?ref=master"))
+=======
+		out.WriteString(fmt.Sprintf("  source            = %q\n", moduleRepo+"//"+modulePath+"?ref=main"))
+>>>>>>> PROPOSED (Claude)
 		out.WriteString(fmt.Sprintf("  name              = %q\n", name))
 		if len(sg) > 0 {
 			out.WriteString(fmt.Sprintf("  security_groups   = %s\n", tfList(sg)))

@@ -125,7 +125,11 @@ aws:
 	mainTf, _ := os.ReadFile(filepath.Join(dir, "main.tf"))
 	for _, want := range []string{
 		`module "public-api"`,
+<<<<<<< CURRENT (yours)
 		`source            = "git@example.com:org/mods.git//alb?ref=master"`,
+=======
+		`source            = "git@example.com:org/mods.git//alb?ref=main"`,
+>>>>>>> PROPOSED (Claude)
 		`subnets           = ["subnet-a", "subnet-b"]`,
 		`security_groups   = ["sg-1"]`,
 		`health_check_path = "HTTP:8080"`,

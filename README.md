@@ -30,7 +30,11 @@ aws:
 
 ```hcl
 module "public-api" {
+<<<<<<< CURRENT (yours)
   source            = "git@github.com:your-org/terraform-modules.git//alb?ref=master"
+=======
+  source            = "git::https://github.com/abraam31/terraform-modules.git//alb?ref=main"
+>>>>>>> PROPOSED (Claude)
   name              = "public-api"
   subnets           = ["subnet-0aaa1111", "subnet-0bbb2222"]
   health_check_path = "HTTP:8080"
@@ -124,7 +128,11 @@ SQS_QUEUE_URL=... ARTIFACTS_DIR=./artifacts make run-worker
 | `ARTIFACTS_DIR` | api, worker | `/app/artifacts` | Local working directory |
 | `TF_RENDER_DIR` | api | `$ARTIFACTS_DIR/jobs` | Where rendered Terraform files are written |
 | `TF_RESULTS_DIR` | worker | `$ARTIFACTS_DIR/results` | Where plan/apply logs are written |
+<<<<<<< CURRENT (yours)
 | `TF_MODULE_REPO` | api | `git@github.com:your-org/terraform-modules.git` | Source repo for Terraform modules |
+=======
+| `TF_MODULE_REPO` | api | `git::https://github.com/abraam31/terraform-modules.git` | Source repo for Terraform modules ([abraam31/terraform-modules](https://github.com/abraam31/terraform-modules)) |
+>>>>>>> PROPOSED (Claude)
 | `GITHUB_TOKEN` | api | *(disabled)* | Turns on fetching from GitHub |
 | `GITHUB_API_BASE_URL` | api | `https://api.github.com` | For GitHub Enterprise |
 | `MOCK_REPO_ROOT` | api | `./mock-repo` | Root folder for `source: local` |
